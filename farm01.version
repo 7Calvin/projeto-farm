@@ -1,0 +1,214 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <time.h>
+
+// ==========================
+// === DEFINES E VARIÁVEIS ===
+// ==========================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SOIL_PIN 34           // Sensor de umidade (analógico)
+#define RELAY_AGUA 26         // Relé 1: Água
+#define RELAY_LUZ 25          // Relé 2: Luz
+#define RELAY_AQUECEDOR 33    // Relé 3: Aquecedor
+#define RELAY_VENTILACAO 32   // Relé 4: Ventilação
+#define UMIDADE_LIMITE 50     // Percentual mínimo para acionar o relé
+#define NUM_LEITURAS 10       // Número de amostras para média
+#define HISTORICO_TAMANHO 30  // Tamanho do histórico no gráfico
+#define INTERVALO_COLETA 180000 // 3 minutos em milissegundos
+
+// REDE WIFI
+const char* ssid = "BLOQUEADA MASTER";
+const char* password = "Jatefalo!";
+
+// Configura IP fixo
+IPAddress local_IP(192, 168, 1, 105);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(8, 8, 8, 8);
+IPAddress secondaryDNS(8, 8, 4, 4);
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+WebServer server(80);
+
+int historico[HISTORICO_TAMANHO];
+String horarios[HISTORICO_TAMANHO];
+int indiceHistorico = 0;
+unsigned long ultimaColeta = 0;
+
+bool estadoAgua = false;
+bool estadoLuz = false;
+bool estadoAquecedor = false;
+bool estadoVentilacao = false;
+int ultimaLeitura = 0;
+String ultimaHora = "";
+
+// ==========================
+// === FUNÇÕES AUXILIARES ===
+// ==========================
+
+int getSoilPercent(int value) {
+  int percent = map(value, 4095, 0, 0, 100);
+  return constrain(percent, 0, 100);
+}
+
+int leituraBrutaMedia() {
+  int soma = 0;
+  for (int i = 0; i < NUM_LEITURAS; i++) {
+    soma += analogRead(SOIL_PIN);
+    delay(10);
+  }
+  return soma / NUM_LEITURAS;
+}
+
+String getHoraFormatada() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  char buffer[20];
+  strftime(buffer, sizeof(buffer), "%d/%m %H:%M", timeinfo);
+  return String(buffer);
+}
+
+void atualizarReleManual() {
+  digitalWrite(RELAY_AGUA, estadoAgua);
+  digitalWrite(RELAY_LUZ, estadoLuz);
+  digitalWrite(RELAY_AQUECEDOR, estadoAquecedor);
+  digitalWrite(RELAY_VENTILACAO, estadoVentilacao);
+}
+
+void handleToggle() {
+  if (server.hasArg("agua")) estadoAgua = server.arg("agua") == "on";
+  if (server.hasArg("luz")) estadoLuz = server.arg("luz") == "on";
+  if (server.hasArg("aquecedor")) estadoAquecedor = server.arg("aquecedor") == "on";
+  if (server.hasArg("ventilacao")) estadoVentilacao = server.arg("ventilacao") == "on";
+  atualizarReleManual();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+String botaoHTML(const String& nome, bool estado, const String& rotulo) {
+  String cor = estado ? "limegreen" : "red";
+  String texto = estado ? "ON" : "OFF";
+  String valor = estado ? "off" : "on";
+  return "<button name='" + nome + "' value='" + valor + "' style='background:" + cor + "; border:none; border-radius:50%; width:60px; height:60px;'>" + texto + "</button><div>" + rotulo + "</div>";
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Umidade</title>";
+  html += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script></head><body style='font-family:sans-serif; display: flex;'>";
+  html += "<div><h3>🌱 Umidade do Solo</h3>";
+  html += "<p>Última medição em: " + ultimaHora + " foi de: <b>" + String(ultimaLeitura) + "%</b></p>";
+  html += "<canvas id='grafico' width='400' height='200' style='background:#eee;'></canvas>";
+  html += "<script>\nconst ctx = document.getElementById('grafico').getContext('2d');\nconst chart = new Chart(ctx, {\n  type: 'line',\n  data: { labels: [";
+  for (int i = 0; i < HISTORICO_TAMANHO; i++) {
+    int idx = (indiceHistorico + i) % HISTORICO_TAMANHO;
+    html += "'" + horarios[idx] + "'";
+    if (i < HISTORICO_TAMANHO - 1) html += ", ";
+  }
+  html += "], datasets: [{ label: 'Umidade (%)', data: [";
+  for (int i = 0; i < HISTORICO_TAMANHO; i++) {
+    int idx = (indiceHistorico + i) % HISTORICO_TAMANHO;
+    html += String(historico[idx]);
+    if (i < HISTORICO_TAMANHO - 1) html += ", ";
+  }
+  html += "], borderColor: 'limegreen', backgroundColor: 'rgba(0,255,0,0.3)', fill: true, tension: 0.2, pointRadius: 3 }] }, options: { scales: { y: { beginAtZero: true, max: 100 }, x: { ticks: { maxRotation: 90, minRotation: 90 } } }, plugins: { legend: { display: false } } } });\n</script></div>";
+
+  html += "<form action='/toggle' method='get'><div style='background:black; color:white; padding:10px; display:grid; grid-template-columns: auto auto; gap:10px; margin-left:20px;'>";
+  html += botaoHTML("luz", estadoLuz, "Luz");
+  html += botaoHTML("agua", estadoAgua, "Agua");
+  html += botaoHTML("aquecedor", estadoAquecedor, "Aquecedor");
+  html += botaoHTML("ventilacao", estadoVentilacao, "Ventilacao");
+  html += "</div></form></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+// ==========================
+// === SETUP INICIAL      ===
+// ==========================
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_AGUA, OUTPUT);
+  pinMode(RELAY_LUZ, OUTPUT);
+  pinMode(RELAY_AQUECEDOR, OUTPUT);
+  pinMode(RELAY_VENTILACAO, OUTPUT);
+  atualizarReleManual();
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("Erro ao iniciar OLED");
+    while (true);
+  }
+
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Conectando WiFi...");
+  display.display();
+
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("⚠️ Falha na configuração do IP estático.");
+  }
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi conectado");
+  Serial.println(WiFi.localIP());
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("WiFi OK");
+  display.println(WiFi.localIP());
+  display.display();
+
+  for (int i = 0; i < HISTORICO_TAMANHO; i++) {
+    historico[i] = 0;
+    horarios[i] = "";
+  }
+
+  server.on("/", handleRoot);
+  server.on("/toggle", handleToggle);
+  server.begin();
+}
+
+// ==========================
+// === LOOP PRINCIPAL     ===
+// ==========================
+
+void loop() {
+  server.handleClient();
+
+  if (millis() - ultimaColeta >= INTERVALO_COLETA || ultimaColeta == 0) {
+    int leitura = leituraBrutaMedia();
+    int percent = getSoilPercent(leitura);
+
+    historico[indiceHistorico] = percent;
+    horarios[indiceHistorico] = getHoraFormatada();
+    indiceHistorico = (indiceHistorico + 1) % HISTORICO_TAMANHO;
+    ultimaColeta = millis();
+
+    ultimaLeitura = percent;
+    ultimaHora = getHoraFormatada();
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Umidade do solo:");
+    display.print(percent);
+    display.println("%");
+
+    display.setCursor(0, 32);
+    display.print("Rele Agua: ");
+    display.println(estadoAgua ? "ON" : "OFF");
+    display.display();
+  }
+}

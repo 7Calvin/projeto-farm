@@ -1,0 +1,107 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define NUM_SENSORES 5
+#define RELAY_AGUA 26
+#define RELAY_LUZ 25
+#define RELAY_AQUECEDOR 33
+#define RELAY_VENTILACAO 32
+#define TEMP_SENSOR_PIN 27
+#define NUM_LEITURAS 10
+#define INTERVALO_COLETA 180000
+
+const int soilPins[NUM_SENSORES] = {34, 35, 32, 33, 25};
+
+const char* ssid = "BLOQUEADA MASTER";
+const char* password = "Jatefalo!";
+
+IPAddress local_IP(192, 168, 1, 105);
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+WebServer server(80);
+
+unsigned long ultimaColeta = 0;
+
+bool estadoAgua = false, estadoLuz = false, estadoAquecedor = false, estadoVentilacao = false;
+
+int getSoilPercent(int value) {
+  return constrain(map(value, 4095, 0, 0, 100), 0, 100);
+}
+
+int leituraBrutaMedia(int pin) {
+  int soma = 0;
+  for (int i = 0; i < NUM_LEITURAS; i++) soma += analogRead(pin);
+  return soma / NUM_LEITURAS;
+}
+
+float leituraTemperatura() {
+  int leitura = analogRead(TEMP_SENSOR_PIN);
+  float tensao = (leitura / 4095.0) * 3.3;
+  float tempC = (tensao - 0.5) * 100.0;
+  if (tempC < -30 || tempC > 80) return NAN; // filtro para leituras inválidas
+  return tempC;
+}
+
+void atualizarReleManual() {
+  digitalWrite(RELAY_AGUA, estadoAgua);
+  digitalWrite(RELAY_LUZ, estadoLuz);
+  digitalWrite(RELAY_AQUECEDOR, estadoAquecedor);
+  digitalWrite(RELAY_VENTILACAO, estadoVentilacao);
+}
+
+void handleToggle() {
+  if (server.hasArg("agua")) estadoAgua = server.arg("agua") == "on";
+  if (server.hasArg("luz")) estadoLuz = server.arg("luz") == "on";
+  if (server.hasArg("aquecedor")) estadoAquecedor = server.arg("aquecedor") == "on";
+  if (server.hasArg("ventilacao")) estadoVentilacao = server.arg("ventilacao") == "on";
+  atualizarReleManual();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>Projeto Calvin</title></head><body style='font-family:sans-serif;'>";
+  html += "<h3>🌱 Umidade do Solo</h3>";
+  for (int s = 0; s < NUM_SENSORES; s++) {
+    int leituraMedia = leituraBrutaMedia(soilPins[s]);
+    int umidade = getSoilPercent(leituraMedia);
+    html += "<p>Sensor " + String(s + 1) + ": " + String(umidade) + "%</p>";
+  }
+
+  float temp = leituraTemperatura();
+  html += "<h3>🌡️ Temperatura Ambiente</h3><p>";
+  html += isnan(temp) ? "Sensor desconectado ou leitura inválida" : String(temp, 1) + "°C";
+  html += "</p>";
+
+  html += "<form action='/toggle'>";
+  html += "<button name='agua' value='" + String(estadoAgua ? "off" : "on") + "'>Água</button>";
+  html += "<button name='luz' value='" + String(estadoLuz ? "off" : "on") + "'>Luz</button>";
+  html += "<button name='aquecedor' value='" + String(estadoAquecedor ? "off" : "on") + "'>Aquecedor</button>";
+  html += "<button name='ventilacao' value='" + String(estadoVentilacao ? "off" : "on") + "'>Ventilação</button>";
+  html += "</form></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.config(local_IP, gateway, subnet);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  pinMode(RELAY_AGUA, OUTPUT);
+  pinMode(RELAY_LUZ, OUTPUT);
+  pinMode(RELAY_AQUECEDOR, OUTPUT);
+  pinMode(RELAY_VENTILACAO, OUTPUT);
+
+  atualizarReleManual();
+
+  server.on("/", handleRoot);
+  server.on("/toggle", handleToggle);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+}
